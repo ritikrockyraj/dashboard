@@ -1,5 +1,18 @@
 import { useState, useEffect, useCallback } from 'react';
-import { supabase } from '../lib/supabase';
+
+// Lazy-load supabase so a bad import never crashes the entire app
+let supabaseClient = null;
+const getSupabase = async () => {
+  if (supabaseClient) return supabaseClient;
+  try {
+    const { supabase } = await import('../lib/supabase.js');
+    supabaseClient = supabase;
+    return supabaseClient;
+  } catch (e) {
+    console.warn('Supabase failed to load, running in offline mode.', e);
+    return null;
+  }
+};
 
 // Global cache to prevent race conditions across multiple hooks
 let globalSupabaseCache = null;
@@ -7,90 +20,80 @@ let fetchPromise = null;
 let saveTimeout = null;
 
 export function useLocalStorage(key, initialValue) {
-  // 1. Initialize from LocalStorage synchronously
+  // 1. Initialize from LocalStorage synchronously (works offline)
   const [storedValue, setStoredValue] = useState(() => {
     try {
       const item = window.localStorage.getItem(key);
       return item ? JSON.parse(item) : initialValue;
-    } catch (error) {
-      console.error('Error reading localStorage', error);
+    } catch {
       return initialValue;
     }
   });
 
-  // 2. Fetch from Supabase on mount
+  // 2. Async cloud fetch on mount — NEVER throws
   useEffect(() => {
     const fetchFromSupabase = async () => {
-      // Ensure we only fetch once globally on initial load
-      if (!fetchPromise) {
-        fetchPromise = supabase
-          .from('dashboard_store')
-          .select('state')
-          .eq('id', 'user_data')
-          .single();
-      }
-
       try {
+        const sb = await getSupabase();
+        if (!sb) return; // Offline mode - skip silently
+
+        if (!fetchPromise) {
+          fetchPromise = sb
+            .from('dashboard_store')
+            .select('state')
+            .eq('id', 'user_data')
+            .single();
+        }
+
         const { data, error } = await fetchPromise;
-        
-        if (error && error.code !== 'PGRST116') { // PGRST116 = Row not found
-          console.error('Supabase fetch error:', error);
+
+        if (error && error.code !== 'PGRST116') {
+          console.warn('Supabase fetch error (non-fatal):', error.message);
           return;
         }
 
-        if (data && data.state) {
+        if (data?.state) {
           globalSupabaseCache = data.state;
-          
-          // If the cloud state has this key, update local React state and LocalStorage
           if (globalSupabaseCache[key] !== undefined) {
             setStoredValue(globalSupabaseCache[key]);
             window.localStorage.setItem(key, JSON.stringify(globalSupabaseCache[key]));
           }
-        } else if (!globalSupabaseCache) {
-          // Initialize empty cache if row doesn't exist yet
-          globalSupabaseCache = {};
+        } else {
+          globalSupabaseCache = globalSupabaseCache ?? {};
         }
       } catch (err) {
-        console.error('Error syncing down from Supabase:', err);
+        // Log but NEVER re-throw — app must keep working without cloud sync
+        console.warn('Cloud sync unavailable, using local storage only.', err?.message);
       }
     };
 
     fetchFromSupabase();
   }, [key]);
 
-  // 3. Setter handles React state, LocalStorage, and debounced Supabase sync
+  // 3. Setter — updates state + localStorage + debounced cloud sync
   const setValue = useCallback((value) => {
     try {
       const valueToStore = value instanceof Function ? value(storedValue) : value;
-      
-      // Update React state
       setStoredValue(valueToStore);
-      
-      // Update LocalStorage immediately
-      if (typeof window !== 'undefined') {
-        window.localStorage.setItem(key, JSON.stringify(valueToStore));
-      }
+      window.localStorage.setItem(key, JSON.stringify(valueToStore));
 
-      // Update global cache immediately
       if (!globalSupabaseCache) globalSupabaseCache = {};
       globalSupabaseCache[key] = valueToStore;
 
-      // Auto-debounce Supabase upsert (wait 1 second after last change)
       if (saveTimeout) clearTimeout(saveTimeout);
-      
       saveTimeout = setTimeout(async () => {
-        console.log('Syncing state to Supabase...');
-        const { error } = await supabase
-          .from('dashboard_store')
-          .upsert({ id: 'user_data', state: globalSupabaseCache });
-
-        if (error) {
-          console.error('Supabase upsert error:', error);
-        } else {
-          console.log('✅ Supabase sync complete!');
+        try {
+          const sb = await getSupabase();
+          if (!sb) return;
+          const { error } = await sb
+            .from('dashboard_store')
+            .upsert({ id: 'user_data', state: globalSupabaseCache });
+          if (error) console.warn('Supabase save error (non-fatal):', error.message);
+          else console.log('✅ Cloud sync complete');
+        } catch (e) {
+          console.warn('Cloud save failed silently.', e?.message);
         }
-      }, 1000); 
-
+      }, 1000);
     } catch (error) {
       console.error('Error setting value:', error);
     }
